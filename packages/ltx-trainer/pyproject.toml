@@ -9,11 +9,21 @@ authors = [
 requires-python = ">=3.10"
 dependencies = [
     "ltx-core",
-    "accelerate>=1.2.1",
+    # >=1.13.0 carries PR #3881, which fixes a KeyError('_orig_mod') in
+    # extract_model_from_parallel when the model has torch.compile'd submodules
+    # but is not compiled at the top level. We compile the transformer BLOCKS
+    # (see trainer.py compile_transformer_blocks), so accelerate <1.13.0 crashes
+    # at the first checkpoint save (get_state_dict -> unwrap_model). Do not lower.
+    "accelerate>=1.13.0",
     "av>=14.2.1",
     "bitsandbytes >=0.45.2; sys_platform == 'linux'",
     "google-genai>=2.0",
-    "huggingface-hub[hf-xet]>=0.31.4",
+    # Cap <1.0: transformers (4.57.x) requires huggingface-hub<1.0, but a bare
+    # `accelerate` upgrade will happily pull hub 1.x (accelerate only needs
+    # >=0.21.0), which then breaks `import transformers` / the accelerate CLI
+    # with "huggingface-hub>=0.34.0,<1.0 is required ... found 1.x". Pin the
+    # range that satisfies both. Do not raise the ceiling until transformers does.
+    "huggingface-hub[hf-xet]>=0.34.0,<1.0",
     "imageio>=2.37.0",
     "imageio-ffmpeg>=0.6.0",
     "openai>=2.0",
