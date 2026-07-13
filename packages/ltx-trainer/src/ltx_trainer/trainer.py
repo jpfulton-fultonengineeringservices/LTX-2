@@ -6,6 +6,7 @@ import time
 import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -13,7 +14,7 @@ import torch
 import wandb
 import yaml
 from accelerate import Accelerator, DistributedType
-from accelerate.utils import DistributedDataParallelKwargs, gather_object, set_seed
+from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs, set_seed
 from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict
 from peft.tuners.tuners_utils import BaseTunerLayer
 from peft.utils import ModulesToSaveWrapper
@@ -32,6 +33,7 @@ from torch.optim.lr_scheduler import (
 from torch.utils.data import DataLoader
 
 from ltx_core.text_encoders.gemma import convert_to_additive_mask
+from ltx_core.model.transformer.compiling import CompilationConfig, compile_transformer
 from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.config_display import print_config
@@ -40,6 +42,7 @@ from ltx_trainer.gpu_utils import free_gpu_memory, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
 from ltx_trainer.model_loader import load_embeddings_processor, load_transformer
 from ltx_trainer.progress import TrainingProgress
+from ltx_trainer.fp8_linear import convert_lora_base_linears_to_fp8
 from ltx_trainer.quantization import quantize_model
 from ltx_trainer.sigma_tracker import SigmaBucketTracker
 from ltx_trainer.timestep_samplers import SAMPLERS
@@ -65,6 +68,13 @@ if not IS_MAIN_PROCESS:
 StepCallback = Callable[[int, int, list[Path]], None]  # (step, total, list[sampled_video_path]) -> None
 
 MEMORY_CHECK_INTERVAL = 200
+
+# Fixed byte width for the per-sample validation path exchanged in the
+# fixed-shape all-gather in ``_run_validation`` (see the collection block there).
+# Deterministic sample paths (``.../samples/step_NNNNNN_I.mp4``) are well under
+# this; longer paths are truncated to keep the collective's shape identical on
+# every rank, which is what makes it immune to the old ``gather_object`` OOM race.
+_VAL_PATH_BYTES = 512
 
 
 class TrainingStats(BaseModel):
@@ -152,7 +162,6 @@ class LtxvTrainer:
         self._init_wandb(resume_run_id=resume_run_id)
 
         self._init_dataloader()
-        data_iter = iter(self._dataloader)
         self._init_timestep_sampler()
 
         # Synchronize all processes after initialization
@@ -199,106 +208,162 @@ class LtxvTrainer:
 
             self._accelerator.wait_for_everyone()
 
-            for step in range(remaining_steps * cfg.optimization.gradient_accumulation_steps):
-                # Get next batch, reset the dataloader if needed
-                try:
-                    batch = next(data_iter)
-                except StopIteration:
-                    data_iter = iter(self._dataloader)
-                    batch = next(data_iter)
+            # Iterate the prepared dataloader in whole epochs rather than a flat
+            # micro-step counter with a manual ``iter()`` reset. Under multi-node
+            # DDP + gradient accumulation, the old flat-counter form desynced the
+            # ranks: ``Accelerator.accumulate`` forces a gradient all-reduce on the
+            # dataloader's LAST batch (via ``GradientState.end_of_dataloader``).
+            # With ``per_rank_batches`` not a multiple of ``gradient_accumulation_steps``
+            # (e.g. 65 batches, accum 4), that forced sync lands MID accumulation
+            # group, and recreating the iterator on ``StopIteration`` reset the
+            # gradient state at a point that differed across ranks. Ranks then
+            # disagreed on which ``backward()`` issues the all-reduce: some sat in
+            # the backward all-reduce while another had already run ahead to the
+            # post-step ``wait_for_everyone()`` barrier — a permanent NCCL deadlock.
+            #
+            # Driving the loop straight off the prepared dataloader keeps
+            # ``end_of_dataloader`` firing on the SAME iteration on every rank
+            # (accelerate pads to equal length with ``even_batches=True``), so the
+            # sync/no-sync decision is identical across ranks. We stop once the
+            # target global step is reached, only ever breaking at an optimization
+            # (accumulation-group) boundary so no group is left half-reduced.
+            step = -1
+            training_complete = False
+            while not training_complete:
+                for batch in self._dataloader:
+                    step += 1
+                    step_start_time = time.time()
+                    with self._accelerator.accumulate(self._transformer):
+                        # ``sync_gradients`` is accelerate's authoritative flag for
+                        # "this micro-step closes an accumulation group" — it also
+                        # goes True on the dataloader's last batch. Use it (not a
+                        # manual modulo) so the optimizer step / global-step bump
+                        # happen exactly when the gradient all-reduce fires, keeping
+                        # every rank in lockstep.
+                        is_optimization_step = self._accelerator.sync_gradients
+                        if is_optimization_step:
+                            self._global_step += 1
 
-                step_start_time = time.time()
-                with self._accelerator.accumulate(self._transformer):
-                    is_optimization_step = (step + 1) % cfg.optimization.gradient_accumulation_steps == 0
-                    if is_optimization_step:
-                        self._global_step += 1
+                        output = self._training_step(batch)
+                        self._accelerator.backward(output.loss.mean())
 
-                    output = self._training_step(batch)
-                    self._accelerator.backward(output.loss.mean())
+                        if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
+                            self._accelerator.clip_grad_norm_(
+                                self._trainable_params,
+                                cfg.optimization.max_grad_norm,
+                            )
 
-                    if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
-                        self._accelerator.clip_grad_norm_(
-                            self._trainable_params,
-                            cfg.optimization.max_grad_norm,
+                        self._optimizer.step()
+                        self._optimizer.zero_grad()
+
+                        if self._lr_scheduler is not None:
+                            self._lr_scheduler.step()
+
+                        # ---- Validation / checkpoint trigger (NO extra collective) ----
+                        # DO NOT add a per-step ``wait_for_everyone`` or a ``reduce`` here.
+                        # We tried both and they DEADLOCKED: an extra collective at the
+                        # global-step boundary lets a fast rank finish it and race into the
+                        # next accumulation window's backward all-reduce while a slow rank is
+                        # still in the extra collective -- two different collectives, no shared
+                        # participant, hang (observed: rank 0 parked at the barrier for global
+                        # step N while ranks 1-3 sat in step N+1's optimizer/backward).
+                        #
+                        # The correct rendezvous is the one DDP already gives us for free:
+                        # ``_global_step`` is bumped only on ``sync_gradients`` micro-steps,
+                        # and that same micro-step fires ``backward``'s gradient all-reduce on
+                        # EVERY rank. So ``_global_step`` is identical across ranks here with
+                        # no added collective, and computing the trigger from it alone makes
+                        # every rank take the SAME branch. When all ranks enter validation /
+                        # checkpoint together, the world-collectives inside them always have
+                        # every participant. No lone collective is ever issued.
+                        want_validation = False
+                        want_checkpoint = False
+                        if is_optimization_step and self._global_step > 0:
+                            want_validation = bool(
+                                cfg.validation.interval
+                                and self._global_step % cfg.validation.interval == 0
+                            )
+                            want_checkpoint = bool(
+                                cfg.checkpoints.interval
+                                and self._global_step % cfg.checkpoints.interval == 0
+                            )
+
+                        # Run validation if needed (handles DDP/FSDP work distribution internally)
+                        if want_validation:
+                            with self._offloaded_optimizer_state():
+                                sampled_videos_paths = self._run_validation(progress)
+
+                        # Save checkpoint if needed
+                        if want_checkpoint:
+                            self._save_checkpoint()
+
+                        # Re-sync ONLY after side-work actually ran: validation/checkpoint
+                        # leave ranks at different wall-clock points (uneven generate passes,
+                        # main-only disk / W&B work), so barrier before the next iteration.
+                        # Safe because every rank took the same branch to get here, so this
+                        # barrier always has all participants.
+                        if want_validation or want_checkpoint:
+                            self._accelerator.wait_for_everyone()
+
+                        # Call step callback if provided
+                        if step_callback and is_optimization_step:
+                            step_callback(self._global_step, cfg.optimization.steps, sampled_videos_paths)
+                            # The callback may run arbitrary main-process-only work, so
+                            # re-sync after it too (only when it actually ran). All ranks
+                            # reach this together since the callback is unconditional on
+                            # optimization steps.
+                            self._accelerator.wait_for_everyone()
+
+                        # Update progress and log metrics
+                        current_lr = self._optimizer.param_groups[0]["lr"]
+                        step_time = (time.time() - step_start_time) * cfg.optimization.gradient_accumulation_steps
+                        step_loss = output.loss.detach().mean().item()
+
+                        progress.update_training(
+                            loss=step_loss,
+                            lr=current_lr,
+                            step_time=step_time,
+                            advance=is_optimization_step,
                         )
 
-                    self._optimizer.step()
-                    self._optimizer.zero_grad()
+                        # Log metrics to W&B (only on main process and optimization steps)
+                        if IS_MAIN_PROCESS and is_optimization_step:
+                            # Track per-element loss by sigma bucket
+                            self._sigma_tracker.update(output.sigma.cpu().tolist(), output.loss.detach().cpu().tolist())
+                            metrics = {
+                                "train/loss": step_loss,
+                                "train/learning_rate": current_lr,
+                                "train/step_time": step_time,
+                                "train/global_step": self._global_step,
+                            }
+                            metrics.update(self._sigma_tracker.get_metrics())
+                            self._log_metrics(metrics)
 
-                    if self._lr_scheduler is not None:
-                        self._lr_scheduler.step()
+                        # Fallback logging when progress bars are disabled
+                        if disable_progress_bars and IS_MAIN_PROCESS and self._global_step % 20 == 0:
+                            elapsed = time.time() - train_start_time
+                            steps_done = self._global_step - initial_step
+                            if steps_done > 0:
+                                total_estimated = elapsed / steps_done * remaining_steps
+                                total_time = f"{total_estimated // 3600:.0f}h {(total_estimated % 3600) // 60:.0f}m"
+                            else:
+                                total_time = "calculating..."
+                            logger.info(
+                                f"Step {self._global_step}/{cfg.optimization.steps} - "
+                                f"Loss: {step_loss:.4f}, LR: {current_lr:.2e}, "
+                                f"Time/Step: {step_time:.2f}s, Total Time: {total_time}",
+                            )
 
-                    # Run validation if needed (handles DDP/FSDP work distribution internally)
-                    if (
-                        cfg.validation.interval
-                        and self._global_step > 0
-                        and self._global_step % cfg.validation.interval == 0
-                        and is_optimization_step
-                    ):
-                        with self._offloaded_optimizer_state():
-                            sampled_videos_paths = self._run_validation(progress)
+                        # Sample GPU memory periodically
+                        if step % MEMORY_CHECK_INTERVAL == 0:
+                            current_mem = get_gpu_memory_gb(device)
+                            peak_mem_during_training = max(peak_mem_during_training, current_mem)
 
-                    # Save checkpoint if needed
-                    if (
-                        cfg.checkpoints.interval
-                        and self._global_step > 0
-                        and self._global_step % cfg.checkpoints.interval == 0
-                        and is_optimization_step
-                    ):
-                        self._save_checkpoint()
-
-                    self._accelerator.wait_for_everyone()
-
-                    # Call step callback if provided
-                    if step_callback and is_optimization_step:
-                        step_callback(self._global_step, cfg.optimization.steps, sampled_videos_paths)
-
-                    self._accelerator.wait_for_everyone()
-
-                    # Update progress and log metrics
-                    current_lr = self._optimizer.param_groups[0]["lr"]
-                    step_time = (time.time() - step_start_time) * cfg.optimization.gradient_accumulation_steps
-                    step_loss = output.loss.detach().mean().item()
-
-                    progress.update_training(
-                        loss=step_loss,
-                        lr=current_lr,
-                        step_time=step_time,
-                        advance=is_optimization_step,
-                    )
-
-                    # Log metrics to W&B (only on main process and optimization steps)
-                    if IS_MAIN_PROCESS and is_optimization_step:
-                        # Track per-element loss by sigma bucket
-                        self._sigma_tracker.update(output.sigma.cpu().tolist(), output.loss.detach().cpu().tolist())
-                        metrics = {
-                            "train/loss": step_loss,
-                            "train/learning_rate": current_lr,
-                            "train/step_time": step_time,
-                            "train/global_step": self._global_step,
-                        }
-                        metrics.update(self._sigma_tracker.get_metrics())
-                        self._log_metrics(metrics)
-
-                    # Fallback logging when progress bars are disabled
-                    if disable_progress_bars and IS_MAIN_PROCESS and self._global_step % 20 == 0:
-                        elapsed = time.time() - train_start_time
-                        steps_done = self._global_step - initial_step
-                        if steps_done > 0:
-                            total_estimated = elapsed / steps_done * remaining_steps
-                            total_time = f"{total_estimated // 3600:.0f}h {(total_estimated % 3600) // 60:.0f}m"
-                        else:
-                            total_time = "calculating..."
-                        logger.info(
-                            f"Step {self._global_step}/{cfg.optimization.steps} - "
-                            f"Loss: {step_loss:.4f}, LR: {current_lr:.2e}, "
-                            f"Time/Step: {step_time:.2f}s, Total Time: {total_time}",
-                        )
-
-                    # Sample GPU memory periodically
-                    if step % MEMORY_CHECK_INTERVAL == 0:
-                        current_mem = get_gpu_memory_gb(device)
-                        peak_mem_during_training = max(peak_mem_during_training, current_mem)
+                    # Stop only on an optimization-step boundary so we never leave an
+                    # accumulation group half-reduced (which would desync the ranks).
+                    if is_optimization_step and self._global_step >= cfg.optimization.steps:
+                        training_complete = True
+                        break
 
         # Collect final stats
         train_end_time = time.time()
@@ -429,6 +494,20 @@ class LtxvTrainer:
 
         self._transformer.requires_grad_(False)
 
+        if self._config.acceleration.fp8_base_linear:
+            # Validate config early (fail fast at load), but perform the actual fp8 swap in
+            # _setup_lora AFTER get_peft_model: PEFT cannot LoRA-wrap an Fp8Linear, so we
+            # first let PEFT wrap the real nn.Linears, then swap each wrapper's frozen
+            # base_layer to fp8 (see convert_lora_base_linears_to_fp8).
+            if self._config.model.training_mode != "lora":
+                raise ValueError("acceleration.fp8_base_linear is only supported for LoRA training mode.")
+            if self._config.acceleration.quantization is not None:
+                raise ValueError(
+                    "acceleration.fp8_base_linear and acceleration.quantization both target the base "
+                    "Linear layers; enable only one."
+                )
+
+
     def _collect_trainable_params(self) -> None:
         """Collect trainable parameters based on training mode."""
         if self._config.model.training_mode == "lora":
@@ -461,6 +540,12 @@ class LtxvTrainer:
         # Wrap the transformer with PEFT to add LoRA layers
         # noinspection PyTypeChecker
         self._transformer = get_peft_model(self._transformer, lora_config)
+
+        # After LoRA is attached, swap each wrapper's FROZEN base_layer to fp8. Done here
+        # (not before attach) because PEFT refuses to LoRA-wrap a non-nn.Linear; the LoRA
+        # delta (lora_A/lora_B) stays bf16 while the frozen base matmul runs fp8.
+        if self._config.acceleration.fp8_base_linear:
+            convert_lora_base_linears_to_fp8(self._transformer)
 
     def _load_checkpoint(self) -> None:
         """Load checkpoint if specified in config, then resolve resume state."""
@@ -616,6 +701,30 @@ class LtxvTrainer:
 
         transformer.set_gradient_checkpointing(self._config.optimization.enable_gradient_checkpointing)
 
+        # torch.compile the transformer blocks BEFORE accelerator.prepare wraps the model in DDP.
+        # We compile the unwrapped base LTXModel (the same object the PEFT wrapper delegates to),
+        # so the compiled blocks + patched dynamo forward are what DDP ultimately drives. Measured
+        # 1.44x on a real LoRA fwd+bwd on GB10 (see spike/compile_ab.py); it is the biggest cheap
+        # wall-clock win and composes with gradient checkpointing (checkpoint wraps the compiled
+        # block callable). Uses ltx_core's shape-polymorphic block compile so resolution buckets
+        # don't retrigger compiles.
+        if self._config.acceleration.compile_transformer_blocks:
+            inductor_config: dict[str, object] = {}
+            if self._config.acceleration.compile_benchmark_fusion:
+                inductor_config["benchmark_fusion"] = True
+            compilation_config = CompilationConfig(
+                mode=self._config.acceleration.compile_mode,
+                fullgraph=self._config.acceleration.compile_fullgraph,
+                inductor_config=inductor_config,
+            )
+            logger.info(
+                f"Compiling {transformer.num_blocks} transformer blocks with torch.compile "
+                f"(mode={compilation_config.mode}, fullgraph={compilation_config.fullgraph}, "
+                f"benchmark_fusion={self._config.acceleration.compile_benchmark_fusion}). "
+                "First step will pay a one-time compile cost."
+            )
+            compile_transformer(transformer, compilation_config)
+
         # noinspection PyTypeChecker
         self._transformer = self._accelerator.prepare(self._transformer)
 
@@ -663,13 +772,19 @@ class LtxvTrainer:
             logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
 
         num_workers = self._config.data.num_dataloader_workers
+        # On the GB10/DGX-Spark unified memory pool, pinned host memory is a
+        # discrete-GPU PCIe-transfer optimization with no benefit (host and device
+        # share one coherent LPDDR5X pool) and can hurt — the Spark community repos
+        # disable it. Default matches prior behavior (pin when workers>0); set
+        # SFT_DISABLE_PINNED_MEMORY=1 (train.sh does this on aarch64) to force off.
+        pin_memory = num_workers > 0 and os.environ.get("SFT_DISABLE_PINNED_MEMORY", "0") != "1"
         dataloader = DataLoader(
             self._dataset,
             batch_size=self._config.optimization.batch_size,
             shuffle=True,
             drop_last=True,
             num_workers=num_workers,
-            pin_memory=num_workers > 0,
+            pin_memory=pin_memory,
             persistent_workers=num_workers > 0,
         )
 
@@ -764,12 +879,19 @@ class LtxvTrainer:
         # single-GPU runs. The probing cost is paid only on the first step.
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
+        # Raise the collective watchdog timeout well above the default 10 min. On the
+        # GB10 a single step-0/periodic validation does a full multi-minute video
+        # diffusion (768x768x49, 30 steps) per rank; even with balanced work_items the
+        # collectives on either side of validation must tolerate that wall time without
+        # tripping NCCL's watchdog and tearing down the job.
+        pg_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=60))
+
         # All distributed setup (DDP/FSDP, number of processes, etc.) is controlled by
         # the user's Accelerate configuration (accelerate config / accelerate launch).
         self._accelerator = Accelerator(
             mixed_precision=self._config.acceleration.mixed_precision_mode,
             gradient_accumulation_steps=self._config.optimization.gradient_accumulation_steps,
-            kwargs_handlers=[ddp_kwargs],
+            kwargs_handlers=[ddp_kwargs, pg_kwargs],
         )
 
         if self._accelerator.num_processes > 1:
@@ -841,13 +963,17 @@ class LtxvTrainer:
         """Run distributed validation by delegating to the ValidationRunner.
         Each rank generates its assigned subset of validation samples (round-robin by
         `process_index`/`num_processes`), so all GPUs stay busy and no rank idles long
-        enough to trigger NCCL timeouts. Paths are gathered across ranks so rank 0 has
-        the full list for W&B logging.
+        enough to trigger NCCL timeouts. Sample PATHS are then exchanged via a single
+        FIXED-SHAPE all-gather (one fixed-width row per global sample index), which is
+        immune to the `gather_object` size-desync that could OOM a rank and hang the job.
+        This cluster has NO shared filesystem: each rank writes its media to its own
+        node's LOCAL disk, and `code/sft/collect_samples.sh` rsyncs the files back to
+        rank 0 for viewing -- so we only ever exchange path strings here, never bytes.
         Under FSDP with multiple processes, ranks pad with extra generate passes
         (same sample, no disk write) so every rank runs the same number of forwards --
-        avoids collective mismatch.
-        Note: Multi-node training requires a shared filesystem so rank 0 can read
-        videos written by other ranks.
+        avoids collective mismatch and keeps the barrier arrival balanced.
+        Note: the returned paths point at files on the OWNING rank's local disk; use
+        ``code/sft/collect_samples.sh`` to rsync peer-rank media onto rank 0 for viewing.
         """
         self._optimizer.zero_grad(set_to_none=True)
         free_gpu_memory()
@@ -861,11 +987,14 @@ class LtxvTrainer:
 
         rank_indices = list(range(rank, num_samples, world_size))
         work_items: list[tuple[int, bool]] = [(i, True) for i in rank_indices]
-        if self._accelerator.distributed_type == DistributedType.FSDP and world_size > 1:
-            # FSDP forwards run collective ops; pad short ranks with no-save duplicates so
-            # every rank executes the same number of forwards. A rank with empty
-            # rank_indices (world_size > num_samples) still pads with sample 0 to stay in
-            # sync with the others.
+        if world_size > 1:
+            # Keep the per-rank validation work balanced: every rank runs the SAME number
+            # of generate passes (``max_per_rank``), padding short ranks with no-save
+            # duplicate passes. This is no longer about the old ``gather_object`` size
+            # exchange (removed below) -- it's so all ranks reach the post-validation
+            # barrier at roughly the same wall-clock time, minimizing how long fast ranks
+            # park there. It also keeps FSDP's sharded forwards aligned. A rank with empty
+            # rank_indices (world_size > num_samples) pads with sample 0.
             max_per_rank = math.ceil(num_samples / world_size)
             pad_seed = rank_indices[-1] if rank_indices else 0
             work_items += [(pad_seed, False)] * (max_per_rank - len(work_items))
@@ -883,9 +1012,55 @@ class LtxvTrainer:
         )
 
         if world_size > 1:
-            sampled = sorted(gather_object(sampled), key=lambda x: x[0])
+            # Collect the per-rank sample paths with a FIXED-SHAPE all-gather.
+            #
+            # We must NOT use ``gather_object(sampled)``: it runs a two-phase collective
+            # that first all-gathers each rank's *pickled size*, then ``resize_``s a buffer
+            # to that size and all-gathers the bytes. Under wall-clock skew (one rank still
+            # decoding a video while another reached the gather) the size exchange is
+            # fragile -- a mismatched/garbage size yields a nonsensical ``resize_``
+            # (observed: "Tried to allocate more than 1EB memory") that OOMs the reaching
+            # rank and hangs the rest until the watchdog kills the job. Validating every
+            # few steps hit this near-certainly.
+            #
+            # This GX10 cluster also has NO shared filesystem (NVIDIA Sync mirrors the repo
+            # to each node's LOCAL disk), so rank 0 CANNOT glob peers' sample files -- each
+            # rank's ``step_{step:06d}_{index}.*`` lands only on its own node. The actual
+            # media is pulled back to rank 0 out-of-band by ``code/sft/collect_samples.sh``.
+            # Here we only need the PATH strings, and every rank knows the deterministic
+            # global-index -> path mapping, so we exchange them over a collective whose
+            # SHAPE is identical on every rank (immune to the size-desync above):
+            #
+            #   * a fixed [num_samples, _VAL_PATH_BYTES] uint8 buffer, one row per global
+            #     sample index, holding that index's UTF-8 path (NUL-padded) or all-zeros
+            #     if this rank didn't own/save it;
+            #   * a single ``all_gather`` of that fixed-shape tensor;
+            #   * rank 0 reduces to one path per index (the row any rank filled).
+            #
+            # No variable-size exchange, no object pickling -> no OOM race.
+            index_to_path = {idx: p for idx, p in sampled}
+            local_buf = torch.zeros(
+                (num_samples, _VAL_PATH_BYTES), dtype=torch.uint8, device=self._accelerator.device
+            )
+            for idx, path in index_to_path.items():
+                encoded = str(path).encode("utf-8")[: _VAL_PATH_BYTES]
+                local_buf[idx, : len(encoded)] = torch.tensor(
+                    list(encoded), dtype=torch.uint8, device=self._accelerator.device
+                )
+            gathered = self._accelerator.gather(local_buf)  # [world_size*num_samples, _VAL_PATH_BYTES]
+            gathered = gathered.view(world_size, num_samples, _VAL_PATH_BYTES).cpu()
 
-        paths = [p for _, p in sampled]
+            paths = []
+            for idx in range(num_samples):
+                # Any rank that owned this index wrote a non-zero row; take the first.
+                for r in range(world_size):
+                    row = gathered[r, idx]
+                    nz = int(row.nonzero().max().item()) + 1 if bool(row.any()) else 0
+                    if nz:
+                        paths.append(Path(bytes(row[:nz].tolist()).decode("utf-8")))
+                        break
+        else:
+            paths = [p for _, p in sampled]
 
         if (
             self._accelerator.is_main_process

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Literal
 import torch
 from einops import rearrange
 from torch import Tensor
+from torch.nn.parallel import DistributedDataParallel
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF  # noqa: N812
 from torchvision.transforms.functional import to_tensor
@@ -177,6 +178,15 @@ class ValidationRunner:
         samples = self._config.samples
         if not samples:
             return []
+
+        # Validation runs in inference (no gradient sync), so a DistributedDataParallel
+        # wrapper only gets in the way: downstream code reads module attributes directly
+        # (e.g. transformer.num_blocks, transformer.parameters()) which DDP does not
+        # forward. Unwrap to the underlying module. FSDP is intentionally left wrapped —
+        # its sharded forward is required and the trainer pads work_items to keep the
+        # per-rank collective forwards aligned.
+        if isinstance(transformer, DistributedDataParallel):
+            transformer = transformer.module
 
         if work_items is None:
             work_items = [(i, True) for i in range(len(samples))]

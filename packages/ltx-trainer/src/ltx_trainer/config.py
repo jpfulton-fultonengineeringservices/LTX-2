@@ -386,6 +386,59 @@ class AccelerationConfig(ConfigBaseModel):
         description="Quantization precision to use",
     )
 
+    fp8_base_linear: bool = Field(
+        default=False,
+        description="[SUPERSEDED by compile_transformer_blocks for wall-clock — kept for research] "
+        "Run the FROZEN base transformer's large Linear layers (FF + attention "
+        "projections) as fp8 (e4m3) matmuls via torch._scaled_mm, keeping outputs in bf16. "
+        "Unlike `quantization` (optimum-quanto, weight-only dequant-to-bf16, a MEMORY "
+        "optimization), this is a COMPUTE optimization. Numerically validated (cosine 0.99966, "
+        "no NaN) but measured only ~1.19x on a real LoRA forward+backward on GB10, because the "
+        "activation-gradient backward runs bf16 and _scaled_mm has no native autograd (we wrap "
+        "it in a custom Function). torch.compile alone measured 1.44x on the same stack with "
+        "zero custom code, so prefer `compile_transformer_blocks`. Only valid for LoRA training: "
+        "the base is frozen so fp8 rounding is a fixed error the bf16 LoRA adapters learn to "
+        "correct. Applied after LoRA attach, swapping each lora.Linear's frozen base_layer.",
+    )
+
+    compile_transformer_blocks: bool = Field(
+        default=False,
+        description="Compile each transformer block with torch.compile (via "
+        "ltx_core.model.transformer.compiling.compile_transformer). On GB10 (sm_121, torch "
+        "2.9.1+cu130) this measured 1.44x on a real LoRA forward+backward with near-identical "
+        "outputs (cosine 0.99998, no NaN) and ~5s compile cost — the single biggest cheap "
+        "wall-clock lever, matching sayakpaul/ltx2-simple-optims (1.33x fwd-only on this DiT). "
+        "Uses the codebase's shape-polymorphic block compile (dynamic seq-length marking so "
+        "resolution buckets don't retrigger compiles; STG-safe perturbation masks). NOTE: "
+        "inductor's default mode raises peak activation VRAM (~46GB->72GB in the microbench) by "
+        "trading memory for fewer recomputes; fine on the 128GB unified pool but watch it "
+        "against gradient checkpointing. Ignore AEON-7's TORCH_COMPILE_DISABLE guidance: that "
+        "was for their torch 2.9.1 Triton SASS issue which does not reproduce on our build.",
+    )
+
+    compile_mode: str | None = Field(
+        default=None,
+        description="torch.compile `mode` passed to block compilation when "
+        "compile_transformer_blocks is set (e.g. 'max-autotune', 'reduce-overhead'). Default "
+        "None uses inductor's default mode. On GB10 'max-autotune' logs 'Not enough SMs to use "
+        "max_autotune_gemm' and falls back, so the default mode is recommended.",
+    )
+
+    compile_fullgraph: bool = Field(
+        default=False,
+        description="Pass fullgraph=True to torch.compile for transformer blocks. Requires the "
+        "block forward to be graph-breakless; leave False for the safe path (graph breaks are "
+        "allowed and only cost a little). Only set True after confirming the block traces whole.",
+    )
+
+    compile_benchmark_fusion: bool = Field(
+        default=True,
+        description="Enable inductor's benchmark_fusion when compiling transformer blocks "
+        "(sayakpaul measured ~3% extra on this DiT). Inductor benchmarks candidate fusions and "
+        "keeps only the ones that actually help. Only takes effect when "
+        "compile_transformer_blocks is True.",
+    )
+
     load_text_encoder_in_8bit: bool = Field(
         default=False,
         description="Whether to load the text encoder in 8-bit precision to save memory",
