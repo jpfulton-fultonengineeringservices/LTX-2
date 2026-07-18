@@ -42,6 +42,7 @@ from ltx_trainer.gpu_utils import free_gpu_memory, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
 from ltx_trainer.model_loader import load_embeddings_processor, load_transformer
 from ltx_trainer.progress import TrainingProgress
+from ltx_trainer.utils import loading_heartbeat
 from ltx_trainer.fp8_linear import convert_lora_base_linears_to_fp8
 from ltx_trainer.quantization import quantize_model
 from ltx_trainer.sigma_tracker import SigmaBucketTracker
@@ -340,7 +341,7 @@ class LtxvTrainer:
                             self._log_metrics(metrics)
 
                         # Fallback logging when progress bars are disabled
-                        if disable_progress_bars and IS_MAIN_PROCESS and self._global_step % 20 == 0:
+                        if disable_progress_bars and IS_MAIN_PROCESS and self._global_step % 10 == 0:
                             elapsed = time.time() - train_start_time
                             steps_done = self._global_step - initial_step
                             if steps_done > 0:
@@ -459,24 +460,26 @@ class LtxvTrainer:
 
     def _load_models(self) -> None:
         """Load the transformer and embeddings processor for training."""
-        logger.debug("Loading transformer...")
-        self._transformer = load_transformer(
-            checkpoint_path=self._config.model.model_path,
-            device="cpu",
-            dtype=torch.bfloat16,
-        )
+        logger.info("Loading transformer from %s ...", self._config.model.model_path)
+        with loading_heartbeat("Transformer", log=logger, interval_s=30.0):
+            self._transformer = load_transformer(
+                checkpoint_path=self._config.model.model_path,
+                device="cpu",
+                dtype=torch.bfloat16,
+            )
 
         # DDP-safe: LOCAL_RANK is set by accelerate before trainer init. Loading on bare
         # "cuda" would resolve to cuda:0 on every rank and crash with a device mismatch.
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         init_device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
-        logger.debug("Loading embeddings processor...")
-        self._embeddings_processor = load_embeddings_processor(
-            checkpoint_path=self._config.model.model_path,
-            device=init_device,
-            dtype=torch.bfloat16,
-        )
+        logger.info("Loading embeddings processor...")
+        with loading_heartbeat("Embeddings processor", log=logger, interval_s=30.0):
+            self._embeddings_processor = load_embeddings_processor(
+                checkpoint_path=self._config.model.model_path,
+                device=init_device,
+                dtype=torch.bfloat16,
+            )
         self._embeddings_processor.feature_extractor = None
 
         transformer_dtype = torch.bfloat16 if self._config.model.training_mode == "lora" else torch.float32

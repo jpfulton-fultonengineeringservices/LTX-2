@@ -59,7 +59,7 @@ from ltx_trainer.model_loader import (
     load_vocoder,
 )
 from ltx_trainer.progress import SamplingContext, TrainingProgress
-from ltx_trainer.utils import open_image_as_srgb, save_image
+from ltx_trainer.utils import loading_heartbeat, open_image_as_srgb, save_image
 from ltx_trainer.video_utils import read_video, save_video
 
 if TYPE_CHECKING:
@@ -205,6 +205,15 @@ class ValidationRunner:
             sample = samples[sample_idx]
             sampling_ctx.start_video(local_i)
 
+            if not progress.enabled:
+                logger.info(
+                    "Validation sample %d/%d (global index %d): generating %d denoising steps...",
+                    local_i + 1,
+                    len(work_items),
+                    sample_idx + 1,
+                    inference_steps,
+                )
+
             cached_embeddings = self._cached_embeddings[sample_idx] if self._cached_embeddings else None
             cached_media = self._cached_media[sample_idx] if self._cached_media else CachedSampleMedia()
 
@@ -269,15 +278,17 @@ class ValidationRunner:
 
         init_device = _local_rank_device()
 
-        logger.debug("Loading text encoder for validation embedding caching...")
-        text_encoder = load_text_encoder(
-            gemma_model_path=text_encoder_path, device=init_device, dtype=torch.bfloat16, load_in_8bit=load_in_8bit
-        )
+        logger.info("Loading text encoder for validation embedding caching...")
+        with loading_heartbeat("Validation text encoder", log=logger, interval_s=30.0):
+            text_encoder = load_text_encoder(
+                gemma_model_path=text_encoder_path, device=init_device, dtype=torch.bfloat16, load_in_8bit=load_in_8bit
+            )
 
-        logger.debug("Loading embeddings processor for validation embedding caching...")
-        embeddings_processor = load_embeddings_processor(
-            checkpoint_path=self._model_path, device=init_device, dtype=torch.bfloat16
-        )
+        logger.info("Loading embeddings processor for validation embedding caching...")
+        with loading_heartbeat("Validation embeddings processor", log=logger, interval_s=30.0):
+            embeddings_processor = load_embeddings_processor(
+                checkpoint_path=self._model_path, device=init_device, dtype=torch.bfloat16
+            )
 
         logger.info(f"Pre-computing embeddings for {len(prompts)} validation prompts...")
         cached: list[CachedPromptEmbeddings] = []
@@ -334,11 +345,13 @@ class ValidationRunner:
         audio_encoder = None
 
         if needs_video_encoder:
-            logger.debug("Loading VAE encoder for validation media encoding...")
-            vae_encoder = load_video_vae_encoder(self._model_path, device="cpu", dtype=torch.bfloat16)
+            logger.info("Loading video VAE encoder for validation media encoding...")
+            with loading_heartbeat("Validation video VAE encoder", log=logger, interval_s=30.0):
+                vae_encoder = load_video_vae_encoder(self._model_path, device="cpu", dtype=torch.bfloat16)
         if needs_audio_encoder:
-            logger.debug("Loading audio VAE encoder for validation media encoding...")
-            audio_encoder = load_audio_vae_encoder(self._model_path, device="cpu", dtype=torch.bfloat16)
+            logger.info("Loading audio VAE encoder for validation media encoding...")
+            with loading_heartbeat("Validation audio VAE encoder", log=logger, interval_s=30.0):
+                audio_encoder = load_audio_vae_encoder(self._model_path, device="cpu", dtype=torch.bfloat16)
 
         logger.info(f"Pre-encoding conditioning media for {len(samples)} validation samples...")
         cached: list[CachedSampleMedia] = []
@@ -417,8 +430,9 @@ class ValidationRunner:
             c.type == "video_to_audio" for s in self._config.samples for c in s.conditions
         )
         if needs_video_decoder:
-            logger.debug("Loading video VAE decoder for validation...")
-            self._vae_decoder = load_video_vae_decoder(self._model_path, device="cpu", dtype=torch.bfloat16)
+            logger.info("Loading video VAE decoder for validation...")
+            with loading_heartbeat("Validation video VAE decoder", log=logger, interval_s=30.0):
+                self._vae_decoder = load_video_vae_decoder(self._model_path, device="cpu", dtype=torch.bfloat16)
             if self._vae_decoder is not None:
                 self._vae_decoder.requires_grad_(False)
 
@@ -428,8 +442,9 @@ class ValidationRunner:
             c.type == "audio_to_video" for s in self._config.samples for c in s.conditions
         )
         if needs_audio_decoder:
-            logger.debug("Loading audio decoder and vocoder for validation...")
-            self._audio_decoder = load_audio_vae_decoder(self._model_path, device="cpu", dtype=torch.bfloat16)
+            logger.info("Loading audio decoder and vocoder for validation...")
+            with loading_heartbeat("Validation audio decoder", log=logger, interval_s=30.0):
+                self._audio_decoder = load_audio_vae_decoder(self._model_path, device="cpu", dtype=torch.bfloat16)
             if self._audio_decoder is not None:
                 self._audio_decoder.requires_grad_(False)
             self._vocoder = load_vocoder(self._model_path, device="cpu", dtype=torch.bfloat16)
