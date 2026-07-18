@@ -15,6 +15,7 @@ Can be used as a standalone script:
 import json
 import math
 import os
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -48,7 +49,7 @@ from ltx_core.model.audio_vae import AudioProcessor
 from ltx_core.types import Audio
 from ltx_trainer import logger
 from ltx_trainer.model_loader import load_audio_vae_encoder, load_video_vae_encoder
-from ltx_trainer.utils import open_image_as_srgb
+from ltx_trainer.utils import log_progress, open_image_as_srgb, stdout_is_tty
 from ltx_trainer.video_utils import get_video_frame_count, read_video
 
 disable_progress_bar()
@@ -497,12 +498,20 @@ def compute_latents(  # noqa: PLR0912, PLR0913, PLR0915
     if dataloader is None:
         return
 
+    if not stdout_is_tty():
+        logger.info("Loading video VAE encoder from %s ...", model_path)
+    _vvae_t0 = time.monotonic()
     with console.status(f"[bold]Loading video VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
         vae = load_video_vae_encoder(model_path, device=torch_device, dtype=torch.bfloat16)
+    if not stdout_is_tty():
+        logger.info("Video VAE encoder loaded (%.1fs)", time.monotonic() - _vvae_t0)
 
     audio_vae_encoder = None
     audio_processor = None
     if with_audio:
+        if not stdout_is_tty():
+            logger.info("Loading audio VAE encoder from %s ...", model_path)
+        _avae_t0 = time.monotonic()
         with console.status(f"[bold]Loading audio VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
             audio_vae_encoder = load_audio_vae_encoder(
                 checkpoint_path=model_path,
@@ -515,6 +524,8 @@ def compute_latents(  # noqa: PLR0912, PLR0913, PLR0915
                 mel_hop_length=audio_vae_encoder.mel_hop_length,
                 n_fft=audio_vae_encoder.n_fft,
             ).to(torch_device)
+        if not stdout_is_tty():
+            logger.info("Audio VAE encoder loaded (%.1fs)", time.monotonic() - _avae_t0)
 
     # Track audio statistics
     audio_success_count = 0
@@ -532,69 +543,70 @@ def compute_latents(  # noqa: PLR0912, PLR0913, PLR0915
         console=console,
     ) as progress:
         task = progress.add_task("Processing videos", total=len(dataloader))
+        with log_progress("Processing videos", total=len(dataloader), log=logger) as advance:
+            for batch in dataloader:
+                # Get video tensor - shape is [B, F, C, H, W] from DataLoader
+                video = batch["video"]
 
-        for batch in dataloader:
-            # Get video tensor - shape is [B, F, C, H, W] from DataLoader
-            video = batch["video"]
+                # Encode video
+                with torch.inference_mode():
+                    video_latent_data = _encode_video(vae=vae, video=video, use_tiling=vae_tiling)
 
-            # Encode video
-            with torch.inference_mode():
-                video_latent_data = _encode_video(vae=vae, video=video, use_tiling=vae_tiling)
+                # Save latents for each item in batch
+                for i in range(len(batch["relative_path"])):
+                    output_rel_path = Path(batch["main_media_relative_path"][i]).with_suffix(".pt")
+                    output_file = output_path / output_rel_path
 
-            # Save latents for each item in batch
-            for i in range(len(batch["relative_path"])):
-                output_rel_path = Path(batch["main_media_relative_path"][i]).with_suffix(".pt")
-                output_file = output_path / output_rel_path
+                    # Create output directory maintaining structure
+                    output_file.parent.mkdir(parents=True, exist_ok=True)
 
-                # Create output directory maintaining structure
-                output_file.parent.mkdir(parents=True, exist_ok=True)
+                    # Store the latent's effective fps (= source_fps / subsample factor).
+                    # Downstream position math expects the rate the saved latents actually have.
+                    effective_fps = batch["video_metadata"]["fps"][i].item() / temporal_subsample_factor
+                    latent_data = {
+                        "latents": video_latent_data["latents"][i].cpu().contiguous(),  # [C, F', H', W']
+                        "num_frames": video_latent_data["num_frames"],
+                        "height": video_latent_data["height"],
+                        "width": video_latent_data["width"],
+                        "fps": effective_fps,
+                    }
 
-                # Store the latent's effective fps (= source_fps / subsample factor).
-                # Downstream position math expects the rate the saved latents actually have.
-                effective_fps = batch["video_metadata"]["fps"][i].item() / temporal_subsample_factor
-                latent_data = {
-                    "latents": video_latent_data["latents"][i].cpu().contiguous(),  # [C, F', H', W']
-                    "num_frames": video_latent_data["num_frames"],
-                    "height": video_latent_data["height"],
-                    "width": video_latent_data["width"],
-                    "fps": effective_fps,
-                }
+                    _atomic_save(latent_data, output_file)
 
-                _atomic_save(latent_data, output_file)
+                    # Process audio if enabled (audio is already extracted by the dataset)
+                    if with_audio:
+                        audio_batch = batch.get("audio")
+                        if audio_batch is not None:
+                            # Extract the i-th item from batched audio data
+                            # DataLoader collates [channels, samples] -> [batch, channels, samples]
+                            audio_data = Audio(
+                                waveform=audio_batch["waveform"][i],
+                                sampling_rate=audio_batch["sample_rate"][i].item(),
+                            )
 
-                # Process audio if enabled (audio is already extracted by the dataset)
-                if with_audio:
-                    audio_batch = batch.get("audio")
-                    if audio_batch is not None:
-                        # Extract the i-th item from batched audio data
-                        # DataLoader collates [channels, samples] -> [batch, channels, samples]
-                        audio_data = Audio(
-                            waveform=audio_batch["waveform"][i],
-                            sampling_rate=audio_batch["sample_rate"][i].item(),
-                        )
+                            # Encode audio
+                            with torch.inference_mode():
+                                audio_latents = _encode_audio(audio_vae_encoder, audio_processor, audio_data)
 
-                        # Encode audio
-                        with torch.inference_mode():
-                            audio_latents = _encode_audio(audio_vae_encoder, audio_processor, audio_data)
+                            # Save audio latents
+                            audio_output_file = audio_output_path / output_rel_path
+                            audio_output_file.parent.mkdir(parents=True, exist_ok=True)
 
-                        # Save audio latents
-                        audio_output_file = audio_output_path / output_rel_path
-                        audio_output_file.parent.mkdir(parents=True, exist_ok=True)
+                            audio_save_data = {
+                                "latents": audio_latents["latents"].cpu().contiguous(),
+                                "num_time_steps": audio_latents["num_time_steps"],
+                                "frequency_bins": audio_latents["frequency_bins"],
+                                "duration": audio_latents["duration"],
+                            }
 
-                        audio_save_data = {
-                            "latents": audio_latents["latents"].cpu().contiguous(),
-                            "num_time_steps": audio_latents["num_time_steps"],
-                            "frequency_bins": audio_latents["frequency_bins"],
-                            "duration": audio_latents["duration"],
-                        }
+                            _atomic_save(audio_save_data, audio_output_file)
+                            audio_success_count += 1
+                        else:
+                            # Video has no audio track
+                            audio_skip_count += 1
 
-                        _atomic_save(audio_save_data, audio_output_file)
-                        audio_success_count += 1
-                    else:
-                        # Video has no audio track
-                        audio_skip_count += 1
-
-            progress.advance(task)
+                progress.advance(task)
+                advance()
 
     logger.info(f"Processed {len(dataloader.dataset)} videos -> {output_path}")  # type: ignore[arg-type]
     if with_audio:
@@ -1103,6 +1115,9 @@ def compute_audio_latents(  # noqa: PLR0915
         _load_paths_from_dataset(dataset_path, naming_column) if naming_column != audio_column else audio_paths
     )
 
+    if not stdout_is_tty():
+        logger.info("Loading audio VAE encoder from %s ...", model_path)
+    _avae_t0 = time.monotonic()
     with console.status(f"[bold]Loading audio VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
         audio_vae_encoder = load_audio_vae_encoder(
             checkpoint_path=model_path,
@@ -1115,6 +1130,8 @@ def compute_audio_latents(  # noqa: PLR0915
             mel_hop_length=audio_vae_encoder.mel_hop_length,
             n_fft=audio_vae_encoder.n_fft,
         ).to(torch_device)
+    if not stdout_is_tty():
+        logger.info("Audio VAE encoder loaded (%.1fs)", time.monotonic() - _avae_t0)
 
     sorted_buckets = sorted(duration_buckets, reverse=True) if duration_buckets else None
     success_count = 0
@@ -1131,61 +1148,65 @@ def compute_audio_latents(  # noqa: PLR0915
         console=console,
     ) as progress:
         task = progress.add_task("Encoding audio", total=len(audio_paths))
+        with log_progress("Encoding audio", total=len(audio_paths), log=logger) as advance:
+            for audio_path, naming_path in zip(audio_paths, naming_paths, strict=True):
+                rel_path = _output_relative(naming_path, data_root)
+                output_file = output_path / rel_path.with_suffix(".pt")
+                output_file.parent.mkdir(parents=True, exist_ok=True)
 
-        for audio_path, naming_path in zip(audio_paths, naming_paths, strict=True):
-            rel_path = _output_relative(naming_path, data_root)
-            output_file = output_path / rel_path.with_suffix(".pt")
-            output_file.parent.mkdir(parents=True, exist_ok=True)
+                if not overwrite and output_file.is_file():
+                    success_count += 1
+                    progress.advance(task)
+                    advance()
+                    continue
 
-            if not overwrite and output_file.is_file():
-                success_count += 1
-                progress.advance(task)
-                continue
-
-            # Load audio (no trimming yet — need full duration for bucket matching)
-            audio = _load_audio_from_file(audio_path)
-            if audio is None:
-                skip_count += 1
-                progress.advance(task)
-                continue
-
-            file_duration = audio.waveform.shape[-1] / audio.sampling_rate
-
-            # Determine target duration: bucket matching, max_duration cap, or full file
-            target_duration = file_duration
-            if sorted_buckets:
-                bucket = next((b for b in sorted_buckets if b <= file_duration), None)
-                if bucket is None:
-                    logger.warning(
-                        f"Skipping {audio_path.name} ({file_duration:.1f}s) — shorter than "
-                        f"smallest bucket ({sorted_buckets[-1]:.1f}s)"
-                    )
+                # Load audio (no trimming yet — need full duration for bucket matching)
+                audio = _load_audio_from_file(audio_path)
+                if audio is None:
                     skip_count += 1
                     progress.advance(task)
+                    advance()
                     continue
-                target_duration = bucket
-            elif max_duration is not None:
-                target_duration = min(file_duration, max_duration)
 
-            # Trim to target duration
-            target_samples = int(target_duration * audio.sampling_rate)
-            trimmed_waveform = audio.waveform[:, :target_samples]
-            audio = Audio(waveform=trimmed_waveform, sampling_rate=audio.sampling_rate)
+                file_duration = audio.waveform.shape[-1] / audio.sampling_rate
 
-            with torch.inference_mode():
-                audio_latents = _encode_audio(audio_vae_encoder, audio_processor, audio)
+                # Determine target duration: bucket matching, max_duration cap, or full file
+                target_duration = file_duration
+                if sorted_buckets:
+                    bucket = next((b for b in sorted_buckets if b <= file_duration), None)
+                    if bucket is None:
+                        logger.warning(
+                            f"Skipping {audio_path.name} ({file_duration:.1f}s) — shorter than "
+                            f"smallest bucket ({sorted_buckets[-1]:.1f}s)"
+                        )
+                        skip_count += 1
+                        progress.advance(task)
+                        advance()
+                        continue
+                    target_duration = bucket
+                elif max_duration is not None:
+                    target_duration = min(file_duration, max_duration)
 
-            _atomic_save(
-                {
-                    "latents": audio_latents["latents"].cpu().contiguous(),
-                    "num_time_steps": audio_latents["num_time_steps"],
-                    "frequency_bins": audio_latents["frequency_bins"],
-                    "duration": audio_latents["duration"],
-                },
-                output_file,
-            )
-            success_count += 1
-            progress.advance(task)
+                # Trim to target duration
+                target_samples = int(target_duration * audio.sampling_rate)
+                trimmed_waveform = audio.waveform[:, :target_samples]
+                audio = Audio(waveform=trimmed_waveform, sampling_rate=audio.sampling_rate)
+
+                with torch.inference_mode():
+                    audio_latents = _encode_audio(audio_vae_encoder, audio_processor, audio)
+
+                _atomic_save(
+                    {
+                        "latents": audio_latents["latents"].cpu().contiguous(),
+                        "num_time_steps": audio_latents["num_time_steps"],
+                        "frequency_bins": audio_latents["frequency_bins"],
+                        "duration": audio_latents["duration"],
+                    },
+                    output_file,
+                )
+                success_count += 1
+                progress.advance(task)
+                advance()
 
     logger.info(f"Audio encoding complete: {success_count} encoded, {skip_count} skipped. Saved to {output_path}")
 

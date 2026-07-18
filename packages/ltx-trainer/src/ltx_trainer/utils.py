@@ -1,5 +1,11 @@
 import io
+import sys
+import time
+from collections.abc import Generator
+from contextlib import contextmanager
+from logging import Logger
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -86,3 +92,91 @@ def save_image(image_tensor: torch.Tensor, output_path: Path | str) -> None:
 
     # Save using PIL
     Image.fromarray(image_np).save(output_path)
+
+
+# ---------------------------------------------------------------------------
+# Non-TTY progress helpers
+# ---------------------------------------------------------------------------
+
+def stdout_is_tty() -> bool:
+    """Return True when stdout is an interactive terminal.
+
+    Rich live-renders spinners and progress bars only in TTY mode and silently
+    drops all rendering when stdout is a pipe (e.g. the ``sed | tee`` pattern
+    used by preprocess_cluster.sh).  Use this to decide whether to emit
+    periodic plain-text heartbeats instead.
+    """
+    return sys.stdout.isatty()
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format a duration in seconds as H:MM:SS or M:SS."""
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{sec:02d}"
+    return f"{m}:{sec:02d}"
+
+
+@contextmanager
+def log_progress(
+    description: str,
+    total: int,
+    log: Logger,
+    *,
+    interval_s: float = 15.0,
+) -> Generator[Any, None, None]:
+    """Context manager that yields an ``advance()`` callable.
+
+    When stdout **is** a TTY this is a no-op (rich's own ``Progress`` widget
+    handles rendering).  When stdout is **not** a TTY it emits a
+    ``logger.info`` heartbeat whenever at least ``interval_s`` seconds have
+    elapsed since the last emit, plus always on the first and last advance.
+
+    Typical use::
+
+        with log_progress("Encoding videos", total=len(dataloader), log=logger) as advance:
+            for batch in dataloader:
+                # ... process batch ...
+                advance()
+
+    Format of each heartbeat line::
+
+        Encoding videos: 40/492 (8.1%) | 2.6 it/s | elapsed 0:15 | ETA 2:53
+    """
+    if stdout_is_tty() or total == 0:
+        yield lambda: None
+        return
+
+    done = 0
+    start = time.monotonic()
+    last_emit = start - interval_s  # emit immediately on first advance
+
+    def advance() -> None:
+        nonlocal done, last_emit
+        done += 1
+        now = time.monotonic()
+        elapsed = now - start
+        since_last = now - last_emit
+        is_first = done == 1
+        is_last = done == total
+        if not (is_first or is_last or since_last >= interval_s):
+            return
+        rate = done / elapsed if elapsed > 0 else 0.0
+        pct = 100.0 * done / total
+        eta_s = (total - done) / rate if rate > 0 else 0.0
+        eta_str = _fmt_duration(eta_s) if done < total else "done"
+        log.info(
+            "%s: %d/%d (%.1f%%) | %.2f it/s | elapsed %s | ETA %s",
+            description,
+            done,
+            total,
+            pct,
+            rate,
+            _fmt_duration(elapsed),
+            eta_str,
+        )
+        last_emit = now
+
+    yield advance

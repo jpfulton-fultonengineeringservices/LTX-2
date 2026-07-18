@@ -13,6 +13,7 @@ Can be used as a standalone script:
 
 import json
 import os
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ from transformers.utils.logging import disable_progress_bar
 
 from ltx_trainer import logger
 from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
+from ltx_trainer.utils import log_progress, stdout_is_tty
 
 # Disable tokenizers parallelism to avoid warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -299,6 +301,9 @@ def compute_captions_embeddings(  # noqa: PLR0913
         return
 
     # Load text encoder and embeddings processor
+    if not stdout_is_tty():
+        logger.info("Loading Gemma text encoder from %s ...", text_encoder_path)
+    _load_t0 = time.monotonic()
     with console.status("[bold]Loading Gemma text encoder...", spinner="dots"):
         text_encoder = load_text_encoder(
             text_encoder_path,
@@ -311,6 +316,8 @@ def compute_captions_embeddings(  # noqa: PLR0913
             device=device,
             dtype=torch.bfloat16,
         )
+    if not stdout_is_tty():
+        logger.info("Gemma text encoder loaded (%.1fs)", time.monotonic() - _load_t0)
 
     logger.info("Text encoder and embeddings processor loaded successfully")
     logger.info(f"Processing captions in {len(dataloader):,} batches...")
@@ -326,37 +333,39 @@ def compute_captions_embeddings(  # noqa: PLR0913
         console=console,
     ) as progress:
         task = progress.add_task("Processing captions", total=len(dataloader))
-        for batch in dataloader:
-            # Encode prompts using text_encoder.encode() + feature_extractor
-            # (returns video/audio features before connector).
-            # The connector is applied during training via embeddings_processor
-            with torch.inference_mode():
-                # TODO(batch-tokenization): When tokenizer supports batching, encode all prompts at once.
-                # For now, process one at a time:
-                for i in range(len(batch["prompt"])):
-                    encoded = text_encoder.encode([batch["prompt"][i]], padding_side="left")
-                    hidden_states, prompt_attention_mask = encoded[0]
-                    video_prompt_embeds, audio_prompt_embeds = embeddings_processor.feature_extractor(
-                        hidden_states, prompt_attention_mask, "left"
-                    )
+        with log_progress("Processing captions", total=len(dataloader), log=logger) as advance:
+            for batch in dataloader:
+                # Encode prompts using text_encoder.encode() + feature_extractor
+                # (returns video/audio features before connector).
+                # The connector is applied during training via embeddings_processor
+                with torch.inference_mode():
+                    # TODO(batch-tokenization): When tokenizer supports batching, encode all prompts at once.
+                    # For now, process one at a time:
+                    for i in range(len(batch["prompt"])):
+                        encoded = text_encoder.encode([batch["prompt"][i]], padding_side="left")
+                        hidden_states, prompt_attention_mask = encoded[0]
+                        video_prompt_embeds, audio_prompt_embeds = embeddings_processor.feature_extractor(
+                            hidden_states, prompt_attention_mask, "left"
+                        )
 
-                    output_rel_path = Path(batch["output_path"][i])
+                        output_rel_path = Path(batch["output_path"][i])
 
-                    # Create output directory maintaining structure
-                    output_dir_path = output_path / output_rel_path.parent
-                    output_dir_path.mkdir(parents=True, exist_ok=True)
+                        # Create output directory maintaining structure
+                        output_dir_path = output_path / output_rel_path.parent
+                        output_dir_path.mkdir(parents=True, exist_ok=True)
 
-                    embedding_data = {
-                        "video_prompt_embeds": video_prompt_embeds[0].cpu().contiguous(),
-                        "prompt_attention_mask": prompt_attention_mask[0].cpu().contiguous(),
-                    }
-                    if audio_prompt_embeds is not None:
-                        embedding_data["audio_prompt_embeds"] = audio_prompt_embeds[0].cpu().contiguous()
+                        embedding_data = {
+                            "video_prompt_embeds": video_prompt_embeds[0].cpu().contiguous(),
+                            "prompt_attention_mask": prompt_attention_mask[0].cpu().contiguous(),
+                        }
+                        if audio_prompt_embeds is not None:
+                            embedding_data["audio_prompt_embeds"] = audio_prompt_embeds[0].cpu().contiguous()
 
-                    output_file = output_path / output_rel_path
-                    _atomic_save(embedding_data, output_file)
+                        output_file = output_path / output_rel_path
+                        _atomic_save(embedding_data, output_file)
 
-            progress.advance(task)
+                progress.advance(task)
+                advance()
 
     logger.info(f"Processed {len(dataloader.dataset):,} captions -> {output_path}")  # type: ignore[arg-type]
 
