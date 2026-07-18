@@ -564,8 +564,13 @@ def compute_latents(  # noqa: PLR0912, PLR0913, PLR0915
                     output_rel_path = Path(batch["main_media_relative_path"][i]).with_suffix(".pt")
                     output_file = output_path / output_rel_path
 
-                    # Create output directory maintaining structure
-                    output_file.parent.mkdir(parents=True, exist_ok=True)
+                    # Create output directory maintaining structure.
+                    # Wrap in try/except to tolerate NFS races where concurrent
+                    # ranks both call mkdir on the same new parent simultaneously.
+                    try:
+                        output_file.parent.mkdir(parents=True, exist_ok=True)
+                    except FileExistsError:
+                        pass  # another rank created the directory first — fine
 
                     # Store the latent's effective fps (= source_fps / subsample factor).
                     # Downstream position math expects the rate the saved latents actually have.

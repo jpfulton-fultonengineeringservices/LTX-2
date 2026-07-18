@@ -283,7 +283,10 @@ def compute_captions_embeddings(  # noqa: PLR0913
     logger.info(f"Loaded {len(dataset):,} captions")
 
     output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+    try:
+        output_path.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+        pass
 
     # TODO(batch-tokenization): The current Gemma tokenizer doesn't support batched tokenization.
     if batch_size > 1:
@@ -358,7 +361,10 @@ def compute_captions_embeddings(  # noqa: PLR0913
 
                         # Create output directory maintaining structure
                         output_dir_path = output_path / output_rel_path.parent
-                        output_dir_path.mkdir(parents=True, exist_ok=True)
+                        try:
+                            output_dir_path.mkdir(parents=True, exist_ok=True)
+                        except FileExistsError:
+                            pass
 
                         embedding_data = {
                             "video_prompt_embeds": video_prompt_embeds[0].cpu().contiguous(),
