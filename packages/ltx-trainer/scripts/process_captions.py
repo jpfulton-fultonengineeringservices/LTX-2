@@ -38,7 +38,7 @@ from transformers.utils.logging import disable_progress_bar
 
 from ltx_trainer import logger
 from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
-from ltx_trainer.utils import log_progress, stdout_is_tty
+from ltx_trainer.utils import loading_heartbeat, log_progress, stdout_is_tty
 
 # Disable tokenizers parallelism to avoid warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -304,18 +304,19 @@ def compute_captions_embeddings(  # noqa: PLR0913
     if not stdout_is_tty():
         logger.info("Loading Gemma text encoder from %s ...", text_encoder_path)
     _load_t0 = time.monotonic()
-    with console.status("[bold]Loading Gemma text encoder...", spinner="dots"):
-        text_encoder = load_text_encoder(
-            text_encoder_path,
-            device=device,
-            dtype=torch.bfloat16,
-            load_in_8bit=load_in_8bit,
-        )
-        embeddings_processor = load_embeddings_processor(
-            model_path,
-            device=device,
-            dtype=torch.bfloat16,
-        )
+    with loading_heartbeat("Gemma text encoder", log=logger, interval_s=30.0):
+        with console.status("[bold]Loading Gemma text encoder...", spinner="dots"):
+            text_encoder = load_text_encoder(
+                text_encoder_path,
+                device=device,
+                dtype=torch.bfloat16,
+                load_in_8bit=load_in_8bit,
+            )
+            embeddings_processor = load_embeddings_processor(
+                model_path,
+                device=device,
+                dtype=torch.bfloat16,
+            )
     if not stdout_is_tty():
         logger.info("Gemma text encoder loaded (%.1fs)", time.monotonic() - _load_t0)
 

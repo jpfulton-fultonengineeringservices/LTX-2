@@ -49,7 +49,7 @@ from ltx_core.model.audio_vae import AudioProcessor
 from ltx_core.types import Audio
 from ltx_trainer import logger
 from ltx_trainer.model_loader import load_audio_vae_encoder, load_video_vae_encoder
-from ltx_trainer.utils import log_progress, open_image_as_srgb, stdout_is_tty
+from ltx_trainer.utils import loading_heartbeat, log_progress, open_image_as_srgb, stdout_is_tty
 from ltx_trainer.video_utils import get_video_frame_count, read_video
 
 disable_progress_bar()
@@ -501,8 +501,9 @@ def compute_latents(  # noqa: PLR0912, PLR0913, PLR0915
     if not stdout_is_tty():
         logger.info("Loading video VAE encoder from %s ...", model_path)
     _vvae_t0 = time.monotonic()
-    with console.status(f"[bold]Loading video VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
-        vae = load_video_vae_encoder(model_path, device=torch_device, dtype=torch.bfloat16)
+    with loading_heartbeat("Video VAE encoder", log=logger, interval_s=30.0):
+        with console.status(f"[bold]Loading video VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
+            vae = load_video_vae_encoder(model_path, device=torch_device, dtype=torch.bfloat16)
     if not stdout_is_tty():
         logger.info("Video VAE encoder loaded (%.1fs)", time.monotonic() - _vvae_t0)
 
@@ -512,18 +513,19 @@ def compute_latents(  # noqa: PLR0912, PLR0913, PLR0915
         if not stdout_is_tty():
             logger.info("Loading audio VAE encoder from %s ...", model_path)
         _avae_t0 = time.monotonic()
-        with console.status(f"[bold]Loading audio VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
-            audio_vae_encoder = load_audio_vae_encoder(
-                checkpoint_path=model_path,
-                device=torch_device,
-                dtype=torch.float32,  # Audio VAE needs float32 for quality. TODO: re-test with bfloat16.
-            )
-            audio_processor = AudioProcessor(
-                target_sample_rate=audio_vae_encoder.sample_rate,
-                mel_bins=audio_vae_encoder.mel_bins,
-                mel_hop_length=audio_vae_encoder.mel_hop_length,
-                n_fft=audio_vae_encoder.n_fft,
-            ).to(torch_device)
+        with loading_heartbeat("Audio VAE encoder", log=logger, interval_s=30.0):
+            with console.status(f"[bold]Loading audio VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
+                audio_vae_encoder = load_audio_vae_encoder(
+                    checkpoint_path=model_path,
+                    device=torch_device,
+                    dtype=torch.float32,  # Audio VAE needs float32 for quality. TODO: re-test with bfloat16.
+                )
+                audio_processor = AudioProcessor(
+                    target_sample_rate=audio_vae_encoder.sample_rate,
+                    mel_bins=audio_vae_encoder.mel_bins,
+                    mel_hop_length=audio_vae_encoder.mel_hop_length,
+                    n_fft=audio_vae_encoder.n_fft,
+                ).to(torch_device)
         if not stdout_is_tty():
             logger.info("Audio VAE encoder loaded (%.1fs)", time.monotonic() - _avae_t0)
 

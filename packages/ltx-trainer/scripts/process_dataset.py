@@ -110,6 +110,7 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
         logger.info(f'LoRA trigger word "{lora_trigger}" will be prepended to all captions')
 
     # --- Phase 1: Text encoder ---
+    logger.info("Phase 1/2: computing caption embeddings (loading Gemma text encoder)...")
     with free_gpu_memory_context():
         compute_captions_embeddings(
             dataset_file=dataset_file,
@@ -135,6 +136,7 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
         if auto_audio:
             logger.info("Audio will be auto-extracted from video files (use --skip-audio to disable)")
 
+        logger.info("Phase 2/2: encoding video latents (loading video VAE)...")
         with free_gpu_memory_context():
             compute_latents(
                 dataset_file=dataset_file,

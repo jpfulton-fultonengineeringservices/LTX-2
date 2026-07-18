@@ -1,5 +1,6 @@
 import io
 import sys
+import threading
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -125,7 +126,7 @@ def log_progress(
     total: int,
     log: Logger,
     *,
-    interval_s: float = 15.0,
+    interval_s: float = 10.0,
 ) -> Generator[Any, None, None]:
     """Context manager that yields an ``advance()`` callable.
 
@@ -180,3 +181,52 @@ def log_progress(
         last_emit = now
 
     yield advance
+
+
+@contextmanager
+def loading_heartbeat(
+    description: str,
+    log: Logger,
+    *,
+    interval_s: float = 30.0,
+) -> Generator[None, None, None]:
+    """Emit a periodic "still loading… Xs elapsed" log line during a long blocking load.
+
+    This is a no-op when stdout is a TTY because rich's ``console.status``
+    spinner already provides live feedback.  When stdout is a pipe (cluster
+    mode) rich goes silent, leaving operators staring at a blank terminal
+    for minutes while a large model loads.  This context manager spawns a
+    daemon thread that fires every ``interval_s`` seconds so the log stream
+    shows the process is alive.
+
+    Typical use (wrap the ``console.status`` block)::
+
+        if not stdout_is_tty():
+            logger.info("Loading Gemma text encoder from %s ...", path)
+        with loading_heartbeat("Gemma text encoder", log=logger):
+            with console.status("[bold]Loading Gemma..."):
+                model = load_model(path)
+        if not stdout_is_tty():
+            logger.info("Gemma text encoder loaded (%.1fs)", elapsed)
+    """
+    if stdout_is_tty():
+        yield
+        return
+
+    stop_event = threading.Event()
+    start = time.monotonic()
+
+    def _heartbeat() -> None:
+        tick = 0
+        while not stop_event.wait(timeout=interval_s):
+            tick += 1
+            elapsed = time.monotonic() - start
+            log.info("%s: still loading… %s elapsed", description, _fmt_duration(elapsed))
+
+    thread = threading.Thread(target=_heartbeat, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop_event.set()
+        thread.join(timeout=2)
