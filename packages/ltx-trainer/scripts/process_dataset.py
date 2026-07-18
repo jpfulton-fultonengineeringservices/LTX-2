@@ -125,6 +125,8 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
             device=device,
             load_in_8bit=load_text_encoder_in_8bit,
             overwrite=overwrite,
+            shard_index=shard_index,
+            shard_count=shard_count,
         )
 
     # --- Phase 2: Video VAE (video, reference_video) ---
@@ -150,6 +152,8 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
                 with_audio=auto_audio,
                 audio_output_dir=audio_latents_dir,
                 overwrite=overwrite,
+                shard_index=shard_index,
+                shard_count=shard_count,
             )
 
         # Process reference video if present
@@ -185,6 +189,8 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
                     vae_tiling=vae_tiling,
                     overwrite=overwrite,
                     temporal_subsample_factor=reference_temporal_scale_factor,
+                    shard_index=shard_index,
+                    shard_count=shard_count,
                 )
 
     # --- Phase 2b: Masks (video_mask, audio_mask) — processed after video latents for alignment ---
@@ -377,12 +383,25 @@ def main(  # noqa: PLR0913
         help="Re-compute every item even if its output exists. Use when rerunning with "
         "changed parameters (different model, resolution, etc.) so stale outputs are replaced.",
     ),
+    shard_index: int | None = typer.Option(
+        default=None,
+        help="Explicit shard index (0-based) for cluster preprocessing. When set together "
+        "with --shard-count, overrides accelerate.PartialState() sharding so each node "
+        "deterministically processes its assigned slice of the dataset.",
+    ),
+    shard_count: int | None = typer.Option(
+        default=None,
+        help="Total number of shards for cluster preprocessing. Must be set together with "
+        "--shard-index. Typically equals WORLD_SIZE (number of nodes).",
+    ),
 ) -> None:
     """Preprocess a media dataset for LTX-2 training.
     See module docstring for the convention table. Audio is auto-extracted from
     video files by default — use --skip-audio to disable.
-    For multi-GPU preprocessing, invoke under ``accelerate launch`` -- each process
-    will handle an interleaved shard of the dataset.
+    For multi-node cluster preprocessing, pass --shard-index NODE_RANK and
+    --shard-count WORLD_SIZE so each node processes a deterministic slice;
+    this is more reliable than relying on accelerate.PartialState() sharding
+    when each node runs its own independent ``accelerate launch`` process.
     """
     # Handle deprecated --with-audio flag
     if with_audio:

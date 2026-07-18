@@ -245,12 +245,15 @@ def compute_captions_embeddings(  # noqa: PLR0913
     device: str = "cuda",
     load_in_8bit: bool = False,
     overwrite: bool = False,
+    shard_index: int | None = None,
+    shard_count: int | None = None,
 ) -> None:
     """
     Process captions and save text embeddings.
     Under ``accelerate launch``, each process handles an interleaved shard of
-    the dataset (rank/world read from ``accelerate.PartialState``). Already-
-    computed ``.pt`` outputs are skipped unless ``overwrite=True``; writes are
+    the dataset. When ``shard_index``/``shard_count`` are provided they take
+    precedence over ``accelerate.PartialState()`` (explicit cluster sharding).
+    Already-computed ``.pt`` outputs are skipped unless ``overwrite=True``; writes are
     atomic so an interrupted run is safe to resume.
     Args:
         dataset_file: Path to metadata file (CSV/JSON/JSONL) containing captions and media paths
@@ -296,6 +299,8 @@ def compute_captions_embeddings(  # noqa: PLR0913
         num_workers=2,
         is_done=lambda idx: (output_path / dataset.output_paths[idx]).is_file(),
         overwrite=overwrite,
+        shard_index=shard_index,
+        shard_count=shard_count,
     )
     if dataloader is None:
         return
@@ -389,18 +394,29 @@ def _build_sharded_dataloader(
     num_workers: int,
     is_done: Callable[[int], bool],
     overwrite: bool,
+    shard_index: int | None = None,
+    shard_count: int | None = None,
 ) -> DataLoader | None:
     """Return a DataLoader over this rank's interleaved shard of ``dataset``.
     When ``overwrite`` is False, items whose outputs already exist (per
     ``is_done``) are filtered out. Returns ``None`` if this rank has nothing
     to do, so the caller can early-return without loading any models.
+
+    When ``shard_index``/``shard_count`` are provided (explicit cluster sharding),
+    they take precedence over ``accelerate.PartialState()`` so that independent
+    ``accelerate launch`` processes (one per node, no NCCL rendezvous) shard
+    deterministically rather than all processing the full dataset.
     """
-    state = PartialState()
-    todo = [i for i in range(state.process_index, len(dataset), state.num_processes) if overwrite or not is_done(i)]
+    if shard_count is not None and shard_index is not None:
+        idx, world = shard_index, shard_count
+    else:
+        state = PartialState()
+        idx, world = state.process_index, state.num_processes
+    todo = [i for i in range(idx, len(dataset), world) if overwrite or not is_done(i)]
     if not todo:
-        logger.info(f"Rank {state.process_index}/{state.num_processes}: nothing to do")
+        logger.info(f"Rank {idx}/{world}: nothing to do")
         return None
-    logger.info(f"Rank {state.process_index}/{state.num_processes}: processing {len(todo):,} of {len(dataset):,} items")
+    logger.info(f"Rank {idx}/{world}: processing {len(todo):,} of {len(dataset):,} items")
     return DataLoader(Subset(dataset, todo), batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
 
