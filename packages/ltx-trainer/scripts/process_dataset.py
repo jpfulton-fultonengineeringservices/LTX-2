@@ -71,6 +71,8 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
     audio_durations: list[float] | None = None,
     load_text_encoder_in_8bit: bool = False,
     overwrite: bool = False,
+    shard_index: int | None = None,
+    shard_count: int | None = None,
 ) -> None:
     """Run the preprocessing pipeline with convention-based column detection."""
     _validate_dataset_file(dataset_file)
@@ -446,6 +448,8 @@ def main(  # noqa: PLR0913
         audio_durations=parsed_audio_durations,
         load_text_encoder_in_8bit=load_text_encoder_in_8bit,
         overwrite=overwrite,
+        shard_index=shard_index,
+        shard_count=shard_count,
     )
 
 
