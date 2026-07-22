@@ -1162,7 +1162,15 @@ def compute_audio_latents(  # noqa: PLR0915
         task = progress.add_task("Encoding audio", total=len(audio_paths))
         with log_progress("Encoding audio", total=len(audio_paths), log=logger) as advance:
             for audio_path, naming_path in zip(audio_paths, naming_paths, strict=True):
-                rel_path = _output_relative(naming_path, data_root)
+                # None means the row has no audio column (e.g. silent-source clip).
+                if audio_path is None:
+                    skip_count += 1
+                    progress.advance(task)
+                    advance()
+                    continue
+
+                effective_naming = naming_path if naming_path is not None else audio_path
+                rel_path = _output_relative(effective_naming, data_root)
                 output_file = output_path / rel_path.with_suffix(".pt")
                 output_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1236,8 +1244,13 @@ def _output_relative(path: Path, data_root: Path) -> Path:
         return Path(*path.parts[1:]) if path.is_absolute() else path
 
 
-def _load_paths_from_dataset(dataset_file: Path, column: str) -> list[Path]:
-    """Load file paths from a dataset column, resolving relative to the dataset file's directory."""
+def _load_paths_from_dataset(dataset_file: Path, column: str) -> list[Path | None]:
+    """Load file paths from a dataset column, resolving relative to the dataset file's directory.
+
+    Returns ``None`` in place of a path for rows where the column is absent or
+    empty (e.g. clips that have no audio stream).  Callers must handle ``None``
+    entries in the returned list.
+    """
     data_root = dataset_file.parent
 
     if dataset_file.suffix == ".csv":
@@ -1251,14 +1264,19 @@ def _load_paths_from_dataset(dataset_file: Path, column: str) -> list[Path]:
             data = json.load(f)
         if not isinstance(data, list):
             raise ValueError("JSON file must contain a list of objects")
-        return [data_root / Path(entry[column].strip()) for entry in data]
+        result: list[Path | None] = []
+        for entry in data:
+            val = entry.get(column)
+            result.append(data_root / Path(val.strip()) if val else None)
+        return result
 
     if dataset_file.suffix == ".jsonl":
-        paths = []
+        paths: list[Path | None] = []
         with open(dataset_file, encoding="utf-8") as f:
             for line in f:
                 entry = json.loads(line)
-                paths.append(data_root / Path(entry[column].strip()))
+                val = entry.get(column)
+                paths.append(data_root / Path(val.strip()) if val else None)
         return paths
 
     raise ValueError(f"Unsupported dataset format: {dataset_file.suffix}")
