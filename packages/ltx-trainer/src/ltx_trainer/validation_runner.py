@@ -59,7 +59,7 @@ from ltx_trainer.model_loader import (
     load_vocoder,
 )
 from ltx_trainer.progress import SamplingContext, TrainingProgress
-from ltx_trainer.utils import loading_heartbeat, open_image_as_srgb, save_image
+from ltx_trainer.utils import ensure_dir, loading_heartbeat, open_image_as_srgb, save_image
 from ltx_trainer.video_utils import read_video, save_video
 
 if TYPE_CHECKING:
@@ -197,7 +197,7 @@ class ValidationRunner:
         sampling_ctx = progress.start_sampling(num_prompts=len(work_items), num_steps=inference_steps)
 
         samples_dir = output_dir / "samples"
-        samples_dir.mkdir(exist_ok=True, parents=True)
+        ensure_dir(samples_dir)
 
         results: list[tuple[int, Path]] = []
 

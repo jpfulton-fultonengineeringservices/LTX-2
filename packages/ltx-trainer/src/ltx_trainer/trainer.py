@@ -42,7 +42,7 @@ from ltx_trainer.gpu_utils import free_gpu_memory, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
 from ltx_trainer.model_loader import load_embeddings_processor, load_transformer
 from ltx_trainer.progress import TrainingProgress
-from ltx_trainer.utils import loading_heartbeat
+from ltx_trainer.utils import ensure_dir, loading_heartbeat
 from ltx_trainer.fp8_linear import convert_lora_base_linears_to_fp8
 from ltx_trainer.quantization import quantize_model
 from ltx_trainer.sigma_tracker import SigmaBucketTracker
@@ -168,7 +168,7 @@ class LtxvTrainer:
         # Synchronize all processes after initialization
         self._accelerator.wait_for_everyone()
 
-        Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+        ensure_dir(cfg.output_dir)
 
         # Save the training configuration as YAML
         self._save_config()
@@ -1111,7 +1111,7 @@ class LtxvTrainer:
         if not IS_MAIN_PROCESS:
             return None
 
-        save_dir.mkdir(exist_ok=True, parents=True)
+        ensure_dir(save_dir)
 
         # Determine save precision
         save_dtype = torch.bfloat16 if self._config.checkpoints.precision == "bfloat16" else torch.float32

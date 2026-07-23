@@ -14,6 +14,38 @@ from PIL import ExifTags, Image, ImageCms, ImageOps
 from PIL.Image import Image as PilImage
 
 
+def ensure_dir(path: str | Path, *, retries: int = 5, delay: float = 0.2) -> Path:
+    """``Path.mkdir(parents=True, exist_ok=True)`` that tolerates NFS staleness.
+
+    On NFS, ``os.mkdir`` on an already-existing directory raises ``EEXIST``, and
+    pathlib's ``exist_ok`` recovery then calls ``self.is_dir()`` — a ``stat()``
+    that can be served from a stale/negative attribute cache (or lag behind NFS
+    close-to-open consistency) and return ``False``. When that happens
+    ``mkdir(exist_ok=True)`` spuriously re-raises ``FileExistsError`` for a
+    directory that plainly exists.
+
+    This bit the checkpoint dir on ``/cluster-shared`` (NFS4): a step-N
+    checkpoint saved fine, then the very next ``_save_checkpoint`` crashed on the
+    identical ``mkdir`` of the same directory. Every ``mkdir`` that targets the
+    shared run tree (checkpoints, samples, output_dir) is exposed to this, so
+    they all route through here. Retry with a short backoff, forcing a fresh
+    attribute lookup, and treat "exists and is a directory" as success.
+    """
+    path = Path(path)
+    for attempt in range(retries):
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        except FileExistsError:
+            # Re-check via a fresh stat; if it really is a dir, we're done.
+            if path.is_dir():
+                return path
+            if attempt == retries - 1:
+                raise
+            time.sleep(delay)
+    return path
+
+
 def open_image_as_srgb(image_path: str | Path | io.BytesIO) -> PilImage:
     """
     Opens an image file, applies rotation (if it's set in metadata) and converts it
