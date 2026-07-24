@@ -73,3 +73,6 @@ wandb/
 
 # Binary files
 *.so
+
+packages/ltx-trainer/hub/
+packages/ltx-trainer/xet/
